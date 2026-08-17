@@ -18,11 +18,14 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+# FIXED STEALTH CSS: Hides menus/GitHub links but keeps the Sidebar toggle button visible
 st.markdown("""
     <style>
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
-    header {visibility: hidden;}
+    [data-testid="stHeaderActionElements"] {display: none;}
+    [data-testid="stToolbar"] {display: none;}
+    
     .block-container {
         padding-top: 2rem;
         padding-bottom: 2rem;
