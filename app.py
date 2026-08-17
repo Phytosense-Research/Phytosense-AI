@@ -49,6 +49,10 @@ CLASS_NAMES = [
     'Tomato - Yellow Leaf Curl Virus', 'Tomato - Mosaic Virus', 'Tomato - Healthy'
 ]
 
+# Same threshold used in the Flutter app — kept identical on purpose so both
+# platforms agree on what counts as "not a confident diagnosis".
+CONFIDENCE_THRESHOLD = 0.60
+
 # ==========================================
 # 3. RECURSIVE MODEL SEARCH & CLEAN NAMING
 # ==========================================
@@ -119,6 +123,49 @@ def load_model_from_path(model_path: str):
     except Exception as e:
         return None, 0.0, str(e)
 
+# ==========================================
+# 4b. ARCHITECTURE-AWARE PREPROCESSING
+# ------------------------------------------
+# This is the piece that was missing before. Every model family expects
+# pixels prepared a different way, and the app must match whatever the
+# Flutter build does for the SAME architecture or the two platforms will
+# disagree on the same photo:
+#   - VGG19            -> BGR channel order + ImageNet mean subtraction
+#   - MobileNet/NASNet  -> scaled to [-1, 1]  ( x/127.5 - 1.0 )
+#   - EfficientNet(V2)  -> raw 0-255 pixels, no rescaling (baked into the graph)
+# ==========================================
+def detect_family(label: str) -> str:
+    l = label.lower()
+    if "vgg" in l:
+        return "vgg"
+    if "mobilenet" in l or "nasnet" in l:
+        return "tf_scale"
+    # EfficientNet and anything else defaults to raw passthrough
+    return "raw"
+
+def preprocess_for_model(pil_image: Image.Image, target_size_wh, family: str) -> np.ndarray:
+    """Resize + apply architecture-specific preprocessing.
+    target_size_wh is (width, height), matching PIL's resize() convention."""
+    # Explicit BILINEAR to match Flutter's Interpolation.linear — removes a
+    # source of train/inference pixel drift caused by differing default
+    # resize filters between platforms/libraries.
+    img_resized = pil_image.resize(target_size_wh, Image.Resampling.BILINEAR)
+    arr = np.array(img_resized, dtype=np.float32)  # RGB, range 0-255
+
+    if family == "vgg":
+        r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
+        # Mirrors the Dart VGG19 branch exactly: channel 0 <- B-123.68,
+        # channel 1 <- G-116.779, channel 2 <- R-103.939.
+        ch0 = b - 123.68
+        ch1 = g - 116.779
+        ch2 = r - 103.939
+        arr = np.stack([ch0, ch1, ch2], axis=-1)
+    elif family == "tf_scale":
+        arr = (arr / 127.5) - 1.0
+    # "raw": leave arr as 0-255 float — matches EfficientNet's baked-in rescaling
+
+    return np.expand_dims(arr, axis=0)
+
 def run_inference(model_obj, model_type: str, img_array: np.ndarray):
     start_infer = time.perf_counter()
     
@@ -128,13 +175,19 @@ def run_inference(model_obj, model_type: str, img_array: np.ndarray):
         
         dtype = input_details['dtype']
         
-        # INT8 Quantization handling
-        if dtype in [np.int8, np.uint8]:
+        # INT8 / UINT8 quantization handling
+        if dtype in (np.int8, np.uint8):
             scale, zero_point = input_details['quantization']
             if scale > 0:
-                input_data = np.round((img_array / scale) + zero_point).astype(dtype)
+                quantized = np.round((img_array / scale) + zero_point)
             else:
-                input_data = (img_array * 255.0).astype(dtype)
+                quantized = img_array
+            # THE FIX: clip into the dtype's real range before casting.
+            # Without this, values outside [-128,127] / [0,255] silently
+            # wrap around on cast (e.g. 300 -> 44), producing garbage
+            # predictions that look like a random, overconfident guess.
+            lo, hi = (-128, 127) if dtype == np.int8 else (0, 255)
+            input_data = np.clip(quantized, lo, hi).astype(dtype)
         else:
             input_data = img_array.astype(np.float32)
 
@@ -143,7 +196,7 @@ def run_inference(model_obj, model_type: str, img_array: np.ndarray):
         raw_output = model_obj.get_tensor(output_details['index'])[0]
 
         # INT8 Dequantization handling
-        if output_details['dtype'] in [np.int8, np.uint8]:
+        if output_details['dtype'] in (np.int8, np.uint8):
             o_scale, o_zero = output_details['quantization']
             if o_scale > 0:
                 raw_output = (raw_output.astype(np.float32) - o_zero) * o_scale
@@ -166,6 +219,7 @@ if available_models:
     selected_model_path = available_models[selected_label]
 else:
     st.sidebar.warning("⚠️ No `.h5`, `.keras`, or `.tflite` model files discovered.")
+    selected_label = ""
     selected_model_path = ""
 
 st.sidebar.divider()
@@ -207,14 +261,18 @@ with col2:
             # 1. Dynamically read the required image dimensions from the model to avoid shape errors
             if model_status == "tflite":
                 input_shape = model_obj.get_input_details()[0]['shape']
-                target_shape = (input_shape[2], input_shape[1]) # TFLite shape is [batch, height, width, channels] -> PIL needs (width, height)
+                target_shape = (input_shape[2], input_shape[1])  # TFLite is [batch,H,W,C] -> PIL wants (W,H)
             else:
-                target_shape = (224, 224) # Fallback for keras models
+                # Pull the real input size off the Keras model instead of hardcoding 224,
+                # falling back only if the model reports an unspecified (-1/None) dim.
+                k_shape = model_obj.input_shape  # (None, H, W, C)
+                h = k_shape[1] if k_shape[1] else 224
+                w = k_shape[2] if k_shape[2] else 224
+                target_shape = (w, h)
 
-            # 2. Preprocess
-            img_resized = image.resize(target_shape)
-            img_array = np.array(img_resized, dtype=np.float32) / 255.0
-            img_array = np.expand_dims(img_array, axis=0)
+            # 2. Architecture-aware preprocessing (matches the Flutter app per-model)
+            family = detect_family(selected_label)
+            img_array = preprocess_for_model(image, target_shape, family)
 
             # 3. Run Inference
             raw_predictions, inference_time_ms = run_inference(model_obj, model_status, img_array)
@@ -239,9 +297,12 @@ with col2:
 
             st.divider()
 
-            # 7. Confidence Alert
-            if top_conf < 60.0:
-                st.warning("⚠️ Confidence is below 60%. Image may not be a recognized leaf.")
+            # 7. Confidence Alert — same threshold and wording as the Flutter app
+            if top_conf < (CONFIDENCE_THRESHOLD * 100):
+                st.warning(
+                    f"⚠️ Image not recognized or confidence too low "
+                    f"(best guess {top_conf:.1f}%, below the {CONFIDENCE_THRESHOLD*100:.0f}% threshold)."
+                )
 
             # 8. Diagnostic Breakdown Bars
             for idx in top_3_indices:
