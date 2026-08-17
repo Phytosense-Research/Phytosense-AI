@@ -18,13 +18,12 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# FIXED STEALTH CSS: Hides menus/GitHub links but keeps the Sidebar toggle button visible
+# FIXED STEALTH CSS: Hides menus/GitHub links but keeps the Sidebar toggle button fully visible
 st.markdown("""
     <style>
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
     [data-testid="stHeaderActionElements"] {display: none;}
-    [data-testid="stToolbar"] {display: none;}
     
     .block-container {
         padding-top: 2rem;
@@ -55,7 +54,6 @@ CLASS_NAMES = [
 # ==========================================
 def clean_model_name(filename):
     """Formats raw filenames into clean, professional UI labels."""
-    # Remove extension
     name = os.path.splitext(filename)[0]
     
     # Replace underscores and title case
@@ -94,7 +92,7 @@ def scan_for_models():
     return dict(sorted(found_models.items()))
 
 # ==========================================
-# 4. MODEL LOADER & RUNNER
+# 4. MODEL LOADER & RUNNER (WITH MMAP FIX)
 # ==========================================
 @st.cache_resource(show_spinner=False)
 def load_model_from_path(model_path: str):
@@ -104,9 +102,14 @@ def load_model_from_path(model_path: str):
     start_load = time.perf_counter()
     try:
         if model_path.endswith('.tflite'):
-            # Force XNNPACK off via empty delegates list to prevent crash
-            interpreter = tf.lite.Interpreter(model_path=model_path, experimental_delegates=[])
+            # THE FIX: Read file as bytes into memory to completely bypass "mmap error 22"
+            with open(model_path, 'rb') as f:
+                model_bytes = f.read()
+                
+            # Pass the raw bytes via model_content and block XNNPACK
+            interpreter = tf.lite.Interpreter(model_content=model_bytes, experimental_delegates=[])
             interpreter.allocate_tensors()
+            
             load_time_ms = (time.perf_counter() - start_load) * 1000
             return interpreter, load_time_ms, "tflite"
         else:
