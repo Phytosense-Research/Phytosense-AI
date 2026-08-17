@@ -1,5 +1,8 @@
 import os
-# Fix for the INT8 XNNPACK Delegate Crash
+# NOTE: this env var alone does NOT disable XNNPACK for tf.lite.Interpreter —
+# see load_model_from_path() below for the fix that actually works
+# (experimental_op_resolver_type=BUILTIN_WITHOUT_DEFAULT_DELEGATES). Left set
+# here too since it's harmless and some TF builds do respect it for other paths.
 os.environ["TF_XNNPACK_DISABLE"] = "1"
 
 import time
@@ -109,9 +112,27 @@ def load_model_from_path(model_path: str):
             # THE FIX: Read file as bytes into memory to completely bypass "mmap error 22"
             with open(model_path, 'rb') as f:
                 model_bytes = f.read()
-                
-            # Pass the raw bytes via model_content and block XNNPACK
-            interpreter = tf.lite.Interpreter(model_content=model_bytes, experimental_delegates=[])
+
+            # THE REAL XNNPACK FIX:
+            # `experimental_delegates=[]` and the TF_XNNPACK_DISABLE env var only
+            # control delegates you explicitly ADD — they do nothing to stop
+            # TFLite's own default behavior of auto-attaching the XNNPACK
+            # delegate at interpreter creation. That auto-attach is what was
+            # crashing on MobileNetV3Small INT8 ("Node 117 ... failed to
+            # prepare"), because XNNPACK doesn't support every quantized op
+            # this model uses. `BUILTIN_WITHOUT_DEFAULT_DELEGATES` is the
+            # documented switch that actually prevents that auto-attach, so
+            # the interpreter falls back to TFLite's plain reference kernels.
+            try:
+                interpreter = tf.lite.Interpreter(
+                    model_content=model_bytes,
+                    experimental_op_resolver_type=tf.lite.experimental.OpResolverType.BUILTIN_WITHOUT_DEFAULT_DELEGATES,
+                )
+            except AttributeError:
+                # Older TF builds without this enum — fall back to the
+                # previous behavior rather than crashing the whole loader.
+                interpreter = tf.lite.Interpreter(model_content=model_bytes)
+
             interpreter.allocate_tensors()
             
             load_time_ms = (time.perf_counter() - start_load) * 1000
